@@ -63,7 +63,7 @@ service can share the arm.
 | command                   | effect                                                                   |
 |---------------------------|--------------------------------------------------------------------------|
 | `{"command": "start"}`    | Engage. The teleop pipeline opens on the next deflection.                |
-| `{"command": "stop"}`     | Disengage. Parks the arm at its current pose and closes the pipeline; returns once no further goal will be sent. |
+| `{"command": "stop"}`     | Disengage; the gripper button is ignored until `start`. Parks the arm at its current pose and closes the pipeline; returns once no further goal will be sent. |
 | `{"command": "status"}`   | No change.                                                               |
 
 Each returns `{"running": bool, "velocities": {...}}`. Repeating `start` or

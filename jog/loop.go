@@ -58,6 +58,9 @@ func (j *jog) subscribe(ctx context.Context, ctrl input.Controller) error {
 }
 
 func (j *jog) toggleGripper(ctx context.Context, _ input.Event) {
+	if !j.engaged.Load() {
+		return
+	}
 	opening := !j.gripperOpen.Load()
 	if opening {
 		if err := j.gripper.Open(ctx, nil); err != nil {

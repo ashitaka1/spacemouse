@@ -290,6 +290,33 @@ func TestClose_WhileStoppedSendsNoTeleopStop(t *testing.T) {
 	test.That(t, rec.commands(), test.ShouldResemble, before)
 }
 
+func TestGripperButton_OnlyWhileEngaged(t *testing.T) {
+	j := fiftyHz(t, 0.1)
+	g := &inject.Gripper{}
+	var opens, grabs int
+	g.OpenFunc = func(context.Context, map[string]interface{}) error {
+		opens++
+		return nil
+	}
+	g.GrabFunc = func(context.Context, map[string]interface{}) (bool, error) {
+		grabs++
+		return true, nil
+	}
+	j.gripper = g
+	j.gripperButton = input.ButtonMenu
+	fake := &fakeInput{callbacks: map[axisKey]input.ControlFunction{}}
+	test.That(t, j.subscribe(context.Background(), fake), test.ShouldBeNil)
+
+	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
+	test.That(t, opens+grabs, test.ShouldEqual, 0)
+
+	j.start()
+	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
+	test.That(t, opens, test.ShouldEqual, 1)
+	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
+	test.That(t, grabs, test.ShouldEqual, 1)
+}
+
 // wiredJog returns an engaged jog with an open pipeline, a 1-DoF arm, and a
 // motion service that records the key of every DoCommand it receives.
 func wiredJog(t *testing.T) (*jog, *commandRecorder, func() int) {
