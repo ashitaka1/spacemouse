@@ -3,6 +3,7 @@ package jog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -256,7 +257,7 @@ func TestStop_WhileMovingParksAtCurrentPose(t *testing.T) {
 func TestStop_WaitsForInFlightSend(t *testing.T) {
 	j, rec, _ := wiredJog(t)
 	entered, release := make(chan struct{}), make(chan struct{})
-	rec.blockFirstMove(entered, release)
+	rec.blockFirstMove(entered, release, nil)
 	j.velocities = deflectY
 
 	j.tick()
@@ -284,6 +285,29 @@ func TestStop_WaitsForInFlightSend(t *testing.T) {
 		t.Fatal("stop did not return after the send drained")
 	}
 	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_move", "teleop_move", "teleop_stop"})
+}
+
+func TestStop_LateNotRunningErrorDoesNotReopenPipeline(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	rec.blockFirstMove(entered, release, errors.New("teleop pipeline not running"))
+	j.velocities = deflectY
+
+	j.tick()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tick never sent teleop_move")
+	}
+
+	j.stop(context.Background())
+	want := []string{"teleop_move", "teleop_move", "teleop_stop"}
+	test.That(t, rec.commands(), test.ShouldResemble, want)
+
+	close(release)
+	j.wg.Wait()
+	test.That(t, rec.commands(), test.ShouldResemble, want)
+	test.That(t, j.pipelineOpen.Load(), test.ShouldBeFalse)
 }
 
 func TestStart_ReopensPipelineOnNextDeflection(t *testing.T) {
@@ -429,8 +453,7 @@ func fakeMotion(rec *commandRecorder) *injectmotion.MotionService {
 		return referenceframe.NewPoseInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(armPose)), nil
 	}
 	ms.DoCommandFunc = func(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-		rec.record(cmd)
-		return nil, nil
+		return nil, rec.record(cmd)
 	}
 	return ms
 }
@@ -507,26 +530,28 @@ type commandRecorder struct {
 	payloads []map[string]interface{}
 	added    chan struct{}
 
-	blocked atomic.Bool
-	entered chan struct{}
-	release chan struct{}
+	blocked    atomic.Bool
+	entered    chan struct{}
+	release    chan struct{}
+	blockedErr error
 }
 
 func newCommandRecorder() *commandRecorder {
 	return &commandRecorder{added: make(chan struct{}, 64)}
 }
 
-// blockFirstMove makes the first teleop_move close entered and then wait for release.
-func (r *commandRecorder) blockFirstMove(entered, release chan struct{}) {
+// blockFirstMove makes the first teleop_move close entered, wait for release,
+// and then return err.
+func (r *commandRecorder) blockFirstMove(entered, release chan struct{}, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.entered, r.release = entered, release
+	r.entered, r.release, r.blockedErr = entered, release, err
 }
 
-func (r *commandRecorder) record(cmd map[string]interface{}) {
+func (r *commandRecorder) record(cmd map[string]interface{}) error {
 	r.mu.Lock()
 	r.payloads = append(r.payloads, cmd)
-	entered, release := r.entered, r.release
+	entered, release, blockedErr := r.entered, r.release, r.blockedErr
 	r.mu.Unlock()
 	select {
 	case r.added <- struct{}{}:
@@ -535,7 +560,9 @@ func (r *commandRecorder) record(cmd map[string]interface{}) {
 	if _, ok := cmd["teleop_move"]; ok && release != nil && r.blocked.CompareAndSwap(false, true) {
 		close(entered)
 		<-release
+		return blockedErr
 	}
+	return nil
 }
 
 func (r *commandRecorder) commands() []string {

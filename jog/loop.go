@@ -208,12 +208,17 @@ func (j *jog) tick() {
 	j.moving = true
 	j.moveMu.Unlock()
 
+	j.wg.Add(1)
 	go func() {
+		defer j.wg.Done()
 		defer j.movePending.Store(false)
 		if err := j.sendGoal(j.cancelCtx, goal); err != nil {
 			// Motion service drops the teleop pipeline on any reconfigure (RDK quirk).
 			// Re-open and let the next tick retry.
 			if strings.Contains(err.Error(), "not running") {
+				if !j.engaged.Load() {
+					return
+				}
 				if openErr := j.openPipeline(j.cancelCtx); openErr != nil {
 					j.logger.CWarnw(j.cancelCtx, "pipeline re-open failed", "err", openErr)
 					j.moveMu.Lock()
