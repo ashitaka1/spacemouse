@@ -96,9 +96,6 @@ func (j *jog) tick() {
 	defer j.engageMu.Unlock()
 
 	if !j.engaged.Load() {
-		j.moveMu.Lock()
-		j.virtualGoal = nil
-		j.moveMu.Unlock()
 		return
 	}
 
