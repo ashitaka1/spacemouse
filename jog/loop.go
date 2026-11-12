@@ -89,6 +89,16 @@ func (j *jog) drainLoop() {
 }
 
 func (j *jog) tick() {
+	j.engageMu.Lock()
+	defer j.engageMu.Unlock()
+
+	if !j.engaged.Load() {
+		j.moveMu.Lock()
+		j.virtualGoal = nil
+		j.moveMu.Unlock()
+		return
+	}
+
 	vel := j.currentVelocities()
 	above := j.anyAxisAboveDeadband(vel)
 

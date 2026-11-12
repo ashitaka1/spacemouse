@@ -61,6 +61,7 @@ type Config struct {
 	RotationDegPerSec     *float64 `json:"rotation_deg_per_sec,omitempty"`
 	TickHz                *float64 `json:"tick_hz,omitempty"`
 	MaxJointVelDegsPerSec *float64 `json:"max_joint_vel_degs_per_sec,omitempty"`
+	AutoStart             *bool    `json:"auto_start,omitempty"`
 }
 
 // Validate returns the deps the service requires.
@@ -114,6 +115,11 @@ type jog struct {
 	rotPerSec       float64
 	tickInterval    time.Duration
 	maxJointVelRads float64
+
+	// engageMu serializes start/stop against tick so stop returns only after
+	// the arm is parked and no further goal will be sent.
+	engageMu sync.Mutex
+	engaged  atomic.Bool
 
 	velMu      sync.RWMutex
 	velocities [6]float64
@@ -202,15 +208,18 @@ func newJog(
 		cancelCtx:       cancelCtx,
 		cancelFunc:      cancelFunc,
 	}
+	j.engaged.Store(firstNonNil(cfg.AutoStart, true))
 
 	if err := j.subscribe(ctx, inRes); err != nil {
 		cancelFunc()
 		return nil, fmt.Errorf("subscribe to input_controller: %w", err)
 	}
 
-	if err := j.openPipeline(ctx); err != nil {
-		cancelFunc()
-		return nil, fmt.Errorf("open pipeline: %w", err)
+	if j.engaged.Load() {
+		if err := j.openPipeline(ctx); err != nil {
+			cancelFunc()
+			return nil, fmt.Errorf("open pipeline: %w", err)
+		}
 	}
 
 	j.wg.Add(1)
@@ -223,6 +232,7 @@ func newJog(
 		"tick_interval_ms", j.tickInterval.Milliseconds(),
 		"translation_mm_per_sec", j.transPerSec,
 		"rotation_deg_per_sec", j.rotPerSec,
+		"engaged", j.engaged.Load(),
 	)
 	return j, nil
 }
@@ -287,30 +297,78 @@ func (j *jog) closePipeline(ctx context.Context) {
 	j.pipelineOpen.Store(false)
 }
 
-// DoCommand exposes current velocities so operators can sanity-check the input path.
-func (j *jog) DoCommand(_ context.Context, _ map[string]interface{}) (map[string]interface{}, error) {
-	j.velMu.RLock()
-	defer j.velMu.RUnlock()
+// DoCommand accepts {"command": "start" | "stop" | "status"} and returns the
+// engagement status. Without a command it returns the current velocities.
+func (j *jog) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	name, ok := cmd["command"]
+	if !ok {
+		return map[string]interface{}{"velocities": j.velocityMap()}, nil
+	}
+	switch name {
+	case "start":
+		j.start()
+	case "stop":
+		j.stop(ctx)
+	case "status":
+	default:
+		return nil, fmt.Errorf("unknown command %v", name)
+	}
+	return j.status(), nil
+}
+
+func (j *jog) start() {
+	j.engageMu.Lock()
+	defer j.engageMu.Unlock()
+	j.engaged.Store(true)
+}
+
+func (j *jog) stop(ctx context.Context) {
+	j.engageMu.Lock()
+	defer j.engageMu.Unlock()
+	j.engaged.Store(false)
+
+	j.moveMu.Lock()
+	wasMoving := j.moving
+	j.moving = false
+	j.virtualGoal = nil
+	j.moveMu.Unlock()
+
+	if wasMoving {
+		j.parkArm()
+	} else if j.pipelineOpen.Load() {
+		j.closePipeline(ctx)
+	}
+}
+
+func (j *jog) status() map[string]interface{} {
 	return map[string]interface{}{
-		"velocities": map[string]float64{
-			"x":  j.velocities[0],
-			"y":  j.velocities[1],
-			"z":  j.velocities[2],
-			"rx": j.velocities[3],
-			"ry": j.velocities[4],
-			"rz": j.velocities[5],
-		},
-	}, nil
+		"running":    j.engaged.Load(),
+		"velocities": j.velocityMap(),
+	}
+}
+
+func (j *jog) velocityMap() map[string]float64 {
+	v := j.currentVelocities()
+	return map[string]float64{
+		"x":  v[0],
+		"y":  v[1],
+		"z":  v[2],
+		"rx": v[3],
+		"ry": v[4],
+		"rz": v[5],
+	}
 }
 
 func (j *jog) Close(ctx context.Context) error {
 	j.cancelFunc()
 	j.wg.Wait()
-	j.closePipeline(ctx)
+	if j.pipelineOpen.Load() {
+		j.closePipeline(ctx)
+	}
 	return nil
 }
 
-func firstNonNil(p *float64, def float64) float64 {
+func firstNonNil[T any](p *T, def T) T {
 	if p == nil {
 		return def
 	}

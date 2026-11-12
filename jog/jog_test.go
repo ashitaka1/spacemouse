@@ -10,9 +10,11 @@ import (
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
+	injectmotion "go.viam.com/rdk/testutils/inject/motion"
 	"go.viam.com/test"
 )
 
@@ -193,6 +195,165 @@ func TestConfigValidate(t *testing.T) {
 		input.Named("my-sm").String(),
 		motion.Named(defaultMotionName).String(),
 	})
+}
+
+func TestConfig_AutoStartDefaultsTrue(t *testing.T) {
+	test.That(t, firstNonNil((&Config{}).AutoStart, true), test.ShouldBeTrue)
+	off := false
+	test.That(t, firstNonNil((&Config{AutoStart: &off}).AutoStart, true), test.ShouldBeFalse)
+}
+
+func TestTick_StoppedSkipsArmCalls(t *testing.T) {
+	j, rec, inputsCalls := wiredJog(t)
+	j.engaged.Store(false)
+	j.velocities = [6]float64{0.5}
+
+	j.tick()
+
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
+	test.That(t, inputsCalls(), test.ShouldEqual, 0)
+}
+
+func TestStop_WhileMovingParksAndCloses(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	j.velocities = [6]float64{0.5}
+
+	j.tick()
+	j.stop(context.Background())
+
+	cmds := rec.commands()
+	test.That(t, cmds[0], test.ShouldEqual, "teleop_move")
+	test.That(t, cmds[len(cmds)-1], test.ShouldEqual, "teleop_stop")
+	test.That(t, j.pipelineOpen.Load(), test.ShouldBeFalse)
+
+	j.tick()
+	test.That(t, rec.commands(), test.ShouldResemble, cmds)
+}
+
+func TestStart_ReopensPipelineOnNextDeflection(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	j.engaged.Store(false)
+	j.pipelineOpen.Store(false)
+	j.velocities = [6]float64{0.5}
+
+	_, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "start"})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
+
+	j.tick()
+	test.That(t, rec.commands()[0], test.ShouldEqual, "teleop_start")
+}
+
+func TestStartStop_Idempotent(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	ctx := context.Background()
+
+	for range 2 {
+		resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "start"})
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp["running"], test.ShouldBeTrue)
+	}
+	for range 2 {
+		resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "stop"})
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp["running"], test.ShouldBeFalse)
+	}
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_stop"})
+
+	resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "status"})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, resp["running"], test.ShouldBeFalse)
+	test.That(t, resp, test.ShouldContainKey, "velocities")
+}
+
+func TestDoCommand_UnknownCommandErrors(t *testing.T) {
+	j, _, _ := wiredJog(t)
+	_, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "bogus"})
+	test.That(t, err, test.ShouldNotBeNil)
+}
+
+func TestDoCommand_NoCommandReturnsVelocities(t *testing.T) {
+	j, _, _ := wiredJog(t)
+	j.velocities = [6]float64{0.25}
+	resp, err := j.DoCommand(context.Background(), map[string]interface{}{})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, resp, test.ShouldNotContainKey, "running")
+	test.That(t, resp["velocities"].(map[string]float64)["x"], test.ShouldEqual, 0.25)
+}
+
+func TestClose_WhileStoppedSendsNoTeleopStop(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	j.stop(context.Background())
+	before := rec.commands()
+
+	test.That(t, j.Close(context.Background()), test.ShouldBeNil)
+	test.That(t, rec.commands(), test.ShouldResemble, before)
+}
+
+// wiredJog returns an engaged jog with an open pipeline, a 1-DoF arm, and a
+// motion service that records the key of every DoCommand it receives.
+func wiredJog(t *testing.T) (*jog, *commandRecorder, func() int) {
+	t.Helper()
+	j := fiftyHz(t, 0.1)
+	j.armName = "arm"
+
+	joint, err := referenceframe.NewRotationalFrame("j0", spatialmath.R4AA{RZ: 1}, referenceframe.Limit{Min: -3, Max: 3})
+	test.That(t, err, test.ShouldBeNil)
+	link, err := referenceframe.NewStaticFrame("l0", spatialmath.NewPoseFromPoint(r3.Vector{X: 300}))
+	test.That(t, err, test.ShouldBeNil)
+	j.kinematic, err = referenceframe.NewSerialModel("m", []referenceframe.Frame{joint, link})
+	test.That(t, err, test.ShouldBeNil)
+
+	var inputsMu sync.Mutex
+	var inputsCalls int
+	a := &inject.Arm{}
+	a.CurrentInputsFunc = func(context.Context) ([]referenceframe.Input, error) {
+		inputsMu.Lock()
+		defer inputsMu.Unlock()
+		inputsCalls++
+		return []referenceframe.Input{0}, nil
+	}
+	j.arm = a
+
+	rec := &commandRecorder{}
+	ms := injectmotion.NewMotionService("motion")
+	ms.GetPoseFunc = func(context.Context, string, string, []*referenceframe.LinkInFrame, map[string]interface{}) (*referenceframe.PoseInFrame, error) {
+		return referenceframe.NewPoseInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(r3.Vector{X: 300})), nil
+	}
+	ms.DoCommandFunc = func(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+		for k := range cmd {
+			if k != "component_name" {
+				rec.add(k)
+			}
+		}
+		return nil, nil
+	}
+	j.motionSvc = ms
+
+	j.engaged.Store(true)
+	j.pipelineOpen.Store(true)
+	return j, rec, func() int {
+		inputsMu.Lock()
+		defer inputsMu.Unlock()
+		return inputsCalls
+	}
+}
+
+type commandRecorder struct {
+	mu   sync.Mutex
+	keys []string
+}
+
+func (r *commandRecorder) add(k string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.keys = append(r.keys, k)
+}
+
+func (r *commandRecorder) commands() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.keys...)
 }
 
 // fakeInput is a minimal input.Controller stand-in that lets tests fire events.

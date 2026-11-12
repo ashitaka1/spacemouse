@@ -53,6 +53,22 @@ of blowing up.
 | `rotation_deg_per_sec`    | `30`       | TCP rotation speed at full stick, in deg/s. Direct cap.                  |
 | `max_joint_vel_degs_per_sec` | `90`    | Per-joint velocity cap enforced via Jacobian scaling. Prevents whipping near singularities. |
 | `tick_hz`                 | `50`       | Drain loop rate.                                                         |
+| `auto_start`              | `true`     | Engage on configure. When false, the arm is not driven until `start`.    |
+
+## DoCommand
+
+`start` and `stop` hand the arm to the SpaceMouse and take it back, so another
+service can share the arm.
+
+| command                   | effect                                                                   |
+|---------------------------|--------------------------------------------------------------------------|
+| `{"command": "start"}`    | Engage. The teleop pipeline opens on the next deflection.                |
+| `{"command": "stop"}`     | Disengage. Parks the arm at its current pose and closes the pipeline; returns once no further goal will be sent. |
+| `{"command": "status"}`   | No change.                                                               |
+
+Each returns `{"running": bool, "velocities": {...}}`. Repeating `start` or
+`stop` is a no-op. A command map with no `command` key returns
+`{"velocities": {...}}`.
 
 ## Speed guide
 
