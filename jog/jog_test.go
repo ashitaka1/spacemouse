@@ -2,7 +2,9 @@ package jog
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
+	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
@@ -197,16 +201,32 @@ func TestConfigValidate(t *testing.T) {
 	})
 }
 
-func TestConfig_AutoStartDefaultsTrue(t *testing.T) {
-	test.That(t, firstNonNil((&Config{}).AutoStart, true), test.ShouldBeTrue)
+func TestNewJog_AutoStartDefaultOpensPipeline(t *testing.T) {
+	j, rec, _ := constructedJog(t, nil)
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_start"})
+	test.That(t, j.status()["running"], test.ShouldEqual, true)
+}
+
+func TestNewJog_AutoStartFalseWaitsForStart(t *testing.T) {
 	off := false
-	test.That(t, firstNonNil((&Config{AutoStart: &off}).AutoStart, true), test.ShouldBeFalse)
+	j, rec, in := constructedJog(t, &off)
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
+	test.That(t, j.status()["running"], test.ShouldEqual, false)
+
+	_, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "start"})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
+
+	in.fire(input.AbsoluteY, input.PositionChangeAbs, 0.5)
+	j.tick()
+	rec.waitFor(t, 2)
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_start", "teleop_move"})
 }
 
 func TestTick_StoppedSkipsArmCalls(t *testing.T) {
 	j, rec, inputsCalls := wiredJog(t)
 	j.engaged.Store(false)
-	j.velocities = [6]float64{0.5}
+	j.velocities = deflectY
 
 	j.tick()
 
@@ -214,71 +234,131 @@ func TestTick_StoppedSkipsArmCalls(t *testing.T) {
 	test.That(t, inputsCalls(), test.ShouldEqual, 0)
 }
 
-func TestStop_WhileMovingParksAndCloses(t *testing.T) {
+func TestStop_WhileMovingParksAtCurrentPose(t *testing.T) {
 	j, rec, _ := wiredJog(t)
-	j.velocities = [6]float64{0.5}
+	j.velocities = deflectY
 
 	j.tick()
 	j.stop(context.Background())
 
-	cmds := rec.commands()
-	test.That(t, cmds[0], test.ShouldEqual, "teleop_move")
-	test.That(t, cmds[len(cmds)-1], test.ShouldEqual, "teleop_stop")
+	want := []string{"teleop_move", "teleop_move", "teleop_stop"}
+	test.That(t, rec.commands(), test.ShouldResemble, want)
+	jogged, parked := rec.movePose(t, 0), rec.movePose(t, 1)
+	test.That(t, parked.X, test.ShouldAlmostEqual, armPose.X)
+	test.That(t, parked.Y, test.ShouldAlmostEqual, armPose.Y)
+	test.That(t, jogged.Y, test.ShouldNotAlmostEqual, parked.Y)
 	test.That(t, j.pipelineOpen.Load(), test.ShouldBeFalse)
 
 	j.tick()
-	test.That(t, rec.commands(), test.ShouldResemble, cmds)
+	test.That(t, rec.commands(), test.ShouldResemble, want)
+}
+
+func TestStop_WaitsForInFlightSend(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	rec.blockFirstMove(entered, release)
+	j.velocities = deflectY
+
+	j.tick()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tick never sent teleop_move")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		j.stop(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("stop returned while a goal send was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not return after the send drained")
+	}
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_move", "teleop_move", "teleop_stop"})
 }
 
 func TestStart_ReopensPipelineOnNextDeflection(t *testing.T) {
 	j, rec, _ := wiredJog(t)
 	j.engaged.Store(false)
 	j.pipelineOpen.Store(false)
-	j.velocities = [6]float64{0.5}
+	j.velocities = deflectY
 
-	_, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "start"})
+	resp, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "start"})
 	test.That(t, err, test.ShouldBeNil)
+	test.That(t, resp["running"], test.ShouldEqual, true)
 	test.That(t, rec.commands(), test.ShouldBeEmpty)
 
 	j.tick()
-	test.That(t, rec.commands()[0], test.ShouldEqual, "teleop_start")
+	rec.waitFor(t, 2)
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_start", "teleop_move"})
 }
 
 func TestStartStop_Idempotent(t *testing.T) {
 	j, rec, _ := wiredJog(t)
 	ctx := context.Background()
 
-	for range 2 {
-		resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "start"})
-		test.That(t, err, test.ShouldBeNil)
-		test.That(t, resp["running"], test.ShouldBeTrue)
+	steps := []struct {
+		command string
+		running bool
+	}{
+		{"stop", false},
+		{"start", true},
+		{"start", true},
+		{"stop", false},
+		{"stop", false},
 	}
-	for range 2 {
-		resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "stop"})
-		test.That(t, err, test.ShouldBeNil)
-		test.That(t, resp["running"], test.ShouldBeFalse)
+	for i, step := range steps {
+		resp, err := j.DoCommand(ctx, map[string]interface{}{"command": step.command})
+		if err != nil {
+			t.Fatalf("step %d %q: %v", i, step.command, err)
+		}
+		if resp["running"] != step.running {
+			t.Errorf("step %d %q: running = %v, want %v", i, step.command, resp["running"], step.running)
+		}
 	}
 	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_stop"})
-
-	resp, err := j.DoCommand(ctx, map[string]interface{}{"command": "status"})
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, resp["running"], test.ShouldBeFalse)
-	test.That(t, resp, test.ShouldContainKey, "velocities")
 }
 
-func TestDoCommand_UnknownCommandErrors(t *testing.T) {
-	j, _, _ := wiredJog(t)
+func TestDoCommand_UnknownCommandLeavesStateAlone(t *testing.T) {
+	j, rec, _ := wiredJog(t)
 	_, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "bogus"})
 	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, j.status()["running"], test.ShouldEqual, true)
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
+}
+
+func TestDoCommand_StatusChangesNothing(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	resp, err := j.DoCommand(context.Background(), map[string]interface{}{"command": "status"})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, resp["running"], test.ShouldEqual, true)
+	test.That(t, j.status()["running"], test.ShouldEqual, true)
+	test.That(t, rec.commands(), test.ShouldBeEmpty)
 }
 
 func TestDoCommand_NoCommandReturnsVelocities(t *testing.T) {
 	j, _, _ := wiredJog(t)
-	j.velocities = [6]float64{0.25}
+	j.velocities = [6]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6}
 	resp, err := j.DoCommand(context.Background(), map[string]interface{}{})
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, resp, test.ShouldNotContainKey, "running")
-	test.That(t, resp["velocities"].(map[string]float64)["x"], test.ShouldEqual, 0.25)
+	test.That(t, resp, test.ShouldResemble, map[string]interface{}{
+		"velocities": map[string]float64{"x": 0.1, "y": 0.2, "z": 0.3, "rx": 0.4, "ry": 0.5, "rz": 0.6},
+	})
+}
+
+func TestClose_EngagedClosesPipeline(t *testing.T) {
+	j, rec, _ := wiredJog(t)
+	test.That(t, j.Close(context.Background()), test.ShouldBeNil)
+	test.That(t, rec.commands(), test.ShouldResemble, []string{"teleop_stop"})
 }
 
 func TestClose_WhileStoppedSendsNoTeleopStop(t *testing.T) {
@@ -292,6 +372,7 @@ func TestClose_WhileStoppedSendsNoTeleopStop(t *testing.T) {
 
 func TestGripperButton_OnlyWhileEngaged(t *testing.T) {
 	j := fiftyHz(t, 0.1)
+	j.engaged.Store(false)
 	g := &inject.Gripper{}
 	var opens, grabs int
 	g.OpenFunc = func(context.Context, map[string]interface{}) error {
@@ -307,29 +388,96 @@ func TestGripperButton_OnlyWhileEngaged(t *testing.T) {
 	fake := &fakeInput{callbacks: map[axisKey]input.ControlFunction{}}
 	test.That(t, j.subscribe(context.Background(), fake), test.ShouldBeNil)
 
-	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
-	test.That(t, opens+grabs, test.ShouldEqual, 0)
+	press := func(step string, wantOpens, wantGrabs int) {
+		t.Helper()
+		fake.fire(input.ButtonMenu, input.ButtonPress, 1)
+		if opens != wantOpens {
+			t.Errorf("%s: opens = %d, want %d", step, opens, wantOpens)
+		}
+		if grabs != wantGrabs {
+			t.Errorf("%s: grabs = %d, want %d", step, grabs, wantGrabs)
+		}
+	}
 
+	press("stopped at construction", 0, 0)
 	j.start()
-	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
-	test.That(t, opens, test.ShouldEqual, 1)
-	fake.fire(input.ButtonMenu, input.ButtonPress, 1)
-	test.That(t, grabs, test.ShouldEqual, 1)
+	press("first press after start", 1, 0)
+	press("second press after start", 1, 1)
+	j.stop(context.Background())
+	press("after stop", 1, 1)
+}
+
+var (
+	deflectY = [6]float64{0, 0.5}
+	armPose  = r3.Vector{X: 300}
+)
+
+func oneJointModel(t *testing.T) referenceframe.Model {
+	t.Helper()
+	joint, err := referenceframe.NewRotationalFrame("j0", spatialmath.R4AA{RZ: 1}, referenceframe.Limit{Min: -3, Max: 3})
+	test.That(t, err, test.ShouldBeNil)
+	link, err := referenceframe.NewStaticFrame("l0", spatialmath.NewPoseFromPoint(armPose))
+	test.That(t, err, test.ShouldBeNil)
+	m, err := referenceframe.NewSerialModel("m", []referenceframe.Frame{joint, link})
+	test.That(t, err, test.ShouldBeNil)
+	return m
+}
+
+func fakeMotion(rec *commandRecorder) *injectmotion.MotionService {
+	ms := injectmotion.NewMotionService("motion")
+	ms.GetPoseFunc = func(context.Context, string, string, []*referenceframe.LinkInFrame, map[string]interface{}) (*referenceframe.PoseInFrame, error) {
+		return referenceframe.NewPoseInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(armPose)), nil
+	}
+	ms.DoCommandFunc = func(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+		rec.record(cmd)
+		return nil, nil
+	}
+	return ms
+}
+
+// constructedJog builds the service through newJog with a drain loop too slow
+// to tick during the test, so the test drives tick() itself.
+func constructedJog(t *testing.T, autoStart *bool) (*jog, *commandRecorder, *fakeInput) {
+	t.Helper()
+	rec := newCommandRecorder()
+	a := inject.NewArm("arm")
+	model := oneJointModel(t)
+	a.KinematicsFunc = func(context.Context) (referenceframe.Model, error) { return model, nil }
+	a.CurrentInputsFunc = func(context.Context) ([]referenceframe.Input, error) {
+		return []referenceframe.Input{0}, nil
+	}
+	in := &fakeInput{callbacks: map[axisKey]input.ControlFunction{}}
+	deps := resource.Dependencies{
+		arm.Named("arm"):       a,
+		input.Named("sm"):      in,
+		motion.Named("motion"): fakeMotion(rec),
+	}
+	slow := 0.001
+	conf := resource.Config{
+		Name:  "jog",
+		API:   generic.API,
+		Model: Model,
+		ConvertedAttributes: &Config{
+			ArmName:   "arm",
+			InputName: "sm",
+			TickHz:    &slow,
+			AutoStart: autoStart,
+		},
+	}
+	res, err := newJog(context.Background(), deps, conf, logging.NewTestLogger(t))
+	test.That(t, err, test.ShouldBeNil)
+	j := res.(*jog)
+	t.Cleanup(func() { j.cancelFunc(); j.wg.Wait() })
+	return j, rec, in
 }
 
 // wiredJog returns an engaged jog with an open pipeline, a 1-DoF arm, and a
-// motion service that records the key of every DoCommand it receives.
+// motion service that records every DoCommand it receives.
 func wiredJog(t *testing.T) (*jog, *commandRecorder, func() int) {
 	t.Helper()
 	j := fiftyHz(t, 0.1)
 	j.armName = "arm"
-
-	joint, err := referenceframe.NewRotationalFrame("j0", spatialmath.R4AA{RZ: 1}, referenceframe.Limit{Min: -3, Max: 3})
-	test.That(t, err, test.ShouldBeNil)
-	link, err := referenceframe.NewStaticFrame("l0", spatialmath.NewPoseFromPoint(r3.Vector{X: 300}))
-	test.That(t, err, test.ShouldBeNil)
-	j.kinematic, err = referenceframe.NewSerialModel("m", []referenceframe.Frame{joint, link})
-	test.That(t, err, test.ShouldBeNil)
+	j.kinematic = oneJointModel(t)
 
 	var inputsMu sync.Mutex
 	var inputsCalls int
@@ -342,20 +490,8 @@ func wiredJog(t *testing.T) (*jog, *commandRecorder, func() int) {
 	}
 	j.arm = a
 
-	rec := &commandRecorder{}
-	ms := injectmotion.NewMotionService("motion")
-	ms.GetPoseFunc = func(context.Context, string, string, []*referenceframe.LinkInFrame, map[string]interface{}) (*referenceframe.PoseInFrame, error) {
-		return referenceframe.NewPoseInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(r3.Vector{X: 300})), nil
-	}
-	ms.DoCommandFunc = func(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-		for k := range cmd {
-			if k != "component_name" {
-				rec.add(k)
-			}
-		}
-		return nil, nil
-	}
-	j.motionSvc = ms
+	rec := newCommandRecorder()
+	j.motionSvc = fakeMotion(rec)
 
 	j.engaged.Store(true)
 	j.pipelineOpen.Store(true)
@@ -367,20 +503,84 @@ func wiredJog(t *testing.T) (*jog, *commandRecorder, func() int) {
 }
 
 type commandRecorder struct {
-	mu   sync.Mutex
-	keys []string
+	mu       sync.Mutex
+	payloads []map[string]interface{}
+	added    chan struct{}
+
+	blocked atomic.Bool
+	entered chan struct{}
+	release chan struct{}
 }
 
-func (r *commandRecorder) add(k string) {
+func newCommandRecorder() *commandRecorder {
+	return &commandRecorder{added: make(chan struct{}, 64)}
+}
+
+// blockFirstMove makes the first teleop_move close entered and then wait for release.
+func (r *commandRecorder) blockFirstMove(entered, release chan struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.keys = append(r.keys, k)
+	r.entered, r.release = entered, release
+}
+
+func (r *commandRecorder) record(cmd map[string]interface{}) {
+	r.mu.Lock()
+	r.payloads = append(r.payloads, cmd)
+	entered, release := r.entered, r.release
+	r.mu.Unlock()
+	select {
+	case r.added <- struct{}{}:
+	default:
+	}
+	if _, ok := cmd["teleop_move"]; ok && release != nil && r.blocked.CompareAndSwap(false, true) {
+		close(entered)
+		<-release
+	}
 }
 
 func (r *commandRecorder) commands() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]string(nil), r.keys...)
+	var keys []string
+	for _, p := range r.payloads {
+		for k := range p {
+			if k != "component_name" {
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys
+}
+
+func (r *commandRecorder) waitFor(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for len(r.commands()) < n {
+		select {
+		case <-r.added:
+		case <-deadline:
+			t.Fatalf("waited for %d commands, have %v", n, r.commands())
+		}
+	}
+}
+
+// movePose returns the position of the i-th teleop_move goal.
+func (r *commandRecorder) movePose(t *testing.T, i int) r3.Vector {
+	t.Helper()
+	r.mu.Lock()
+	var moves []string
+	for _, p := range r.payloads {
+		if m, ok := p["teleop_move"].(string); ok {
+			moves = append(moves, m)
+		}
+	}
+	r.mu.Unlock()
+	test.That(t, len(moves), test.ShouldBeGreaterThan, i)
+	var pif struct {
+		Pose struct{ X, Y, Z float64 } `json:"pose"`
+	}
+	test.That(t, json.Unmarshal([]byte(moves[i]), &pif), test.ShouldBeNil)
+	return r3.Vector{X: pif.Pose.X, Y: pif.Pose.Y, Z: pif.Pose.Z}
 }
 
 // fakeInput is a minimal input.Controller stand-in that lets tests fire events.
