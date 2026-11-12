@@ -70,6 +70,11 @@ Each returns `{"running": bool, "velocities": {...}}`. Repeating `start` or
 `stop` is a no-op. A command map with no `command` key returns
 `{"velocities": {...}}`.
 
+The engaged state lives only in the running service. Any reconfigure of the
+jog service or of its dependencies rebuilds it, and it comes back in the state
+`auto_start` sets. A service that shares the arm must configure
+`auto_start: false` so a rebuild never hands the arm back to the SpaceMouse.
+
 ## Speed guide
 
 | use case              | `translation_mm_per_sec` | `rotation_deg_per_sec` |
